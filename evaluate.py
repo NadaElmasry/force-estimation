@@ -1,268 +1,179 @@
+#!/usr/bin/env python3
+# ---------------------------------------------------------------------
+#  evaluate_force_estimator.py  –  2025‑05‑21
+# ---------------------------------------------------------------------
 import argparse
 import os
-import joblib
-from tqdm import tqdm
-import numpy as np
+import time
+from pathlib import Path
 from typing import Tuple
+
+import joblib
 import matplotlib.pyplot as plt
-
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_squared_error
-
+import numpy as np
 import torch
-from torchvision import transforms
+import torch.nn as nn
+from sklearn.metrics import mean_squared_error
+from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import DataLoader
 
-from models.vision_robot_net import VisionRobotNet
-from models.robot_state_transformer import RobotStateTransformer
-from transforms import CropBottom
-from dataset import VisionRobotDataset, SequentialDataset
-import constants
-import util
+from datasets import augmentations
+from datasets.dataset import SequentialDataset
+from datasets.vision_state_dataset import VisionStateDataset
+from logger import AverageMeter
+from models.force_estimator import ForceEstimator
+from utils import load_dataset, none_or_str
 
+# -----------------------  CLI  -------------------------------------- #
+def get_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Evaluate a trained ForceEstimator checkpoint")
+    p.add_argument("--checkpoint", "-c", required=True,
+                   help="*.pth file produced by training script")
+    p.add_argument("--run", type=int, required=True,
+                   help="policy‑run ID to evaluate on")
+    #  model hyper‑params (MUST match the training run!)
+    p.add_argument("--architecture", required=True, choices=["cnn", "vit", "fc"])
+    p.add_argument("--type", required=True, choices=["v", "vs", "s"])
+    p.add_argument("--recurrency", action="store_true")
+    p.add_argument("--seq-length", type=int, default=1)
+    p.add_argument("--state-size", type=int, default=58)
+    p.add_argument("--att-type", default=None)
+    #  misc
+    p.add_argument("--pdf", action="store_true", help="save plots as PDF")
+    p.add_argument("--data-root", default="data", help="root folder with roll_out/")
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    return p.parse_args()
 
-def parse_cmd_line() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-w", "--weights", required=True)
-    parser.add_argument("-r", "--run", required=True, type=int)
-    parser.add_argument("-m", "--model", required=True, type=str)
-    parser.add_argument("--pdf", action='store_true', default=False,
-                        help='stores the plots as pdf instead of png')
-    parser.add_argument('--use_acceleration',
-                        action='store_true', default=False)
-    parser.add_argument("--overfit", action='store_true', default=False)
-    parser.add_argument('--state',
-                        choices=['both', 'robot', 'vision', 'linear', 'conv'],
-                        help='Set the model state: both for VISION_AND_ROBOT, robot for ROBOT_ONLY, vision for VISION_ONLY')
-    parser.add_argument("--model_type", required=True,
-                        choices=['vision_robot', 'transformer'])
+# ------------------  eval helpers  ---------------------------------- #
+def get_val_transforms():
+    norm = augmentations.Normalize([0.45]*3, [0.225]*3)
+    return augmentations.Compose([
+        augmentations.CentreCrop(),
+        augmentations.SquareResize(),
+        augmentations.ArrayToTensor(),
+        norm
+    ])
 
-    return parser.parse_args()
-
-
-def save_predictions(dir: str, forces_pred: np.ndarray, forces_smooth: np.ndarray, forces_gt: np.ndarray):
-    os.makedirs(dir, exist_ok=True)
-    pred_file = os.path.join(dir, "predicted_forces.txt")
-    gt_file = os.path.join(dir, "true_forces.txt")
-    smooth_file = os.path.join(dir, "smoothed_forces.txt")
-    files = [pred_file, smooth_file, gt_file]
-    forces = [forces_pred, forces_smooth, forces_gt]
-
-    for write_file, force_array in zip(files, forces):
-        with open(write_file, 'w', encoding='utf-8') as file:
-            file.write("F_X,F_Y,F_Z\n")
-            for force in force_array:
-                line = "{},{},{}\n".format(force[0], force[1], force[2])
-                file.write(line)
-
-
-def moving_average(data: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    Computes the moving average for each column of data separately.
-
-    Parameters:
-    data (np.ndarray): A 2D array where each column represents a series of data points.
-    window_size (int): The number of data points in each moving average window.
-
-    Returns:
-    np.ndarray: A 2D array with the same shape as data, containing the moving averages.
-    """
-    if window_size > data.shape[0]:
-        raise ValueError(
-            "window_size is larger than the number of rows in data.")
-
-    zero_pad = np.zeros((window_size-1, data.shape[1]))
-    data_padded = np.insert(data, 0, zero_pad, axis=0)
-    cumsum_vec = np.cumsum(data_padded, axis=0)
-    moving_avg = (cumsum_vec[window_size:] -
-                  cumsum_vec[:-window_size]) / window_size
-
-    assert moving_avg.shape[1] == data.shape[
-        1], f"The output shape {moving_avg.shape} does not match the input shape {data.shape}"
-    return moving_avg
-
-
-def plot_forces(forces_pred: np.ndarray,
-                forces_smooth: np.ndarray,
-                forces_gt: np.ndarray,
-                avg_rmse: float,
-                run: int,
-                pdf: bool,
-                save_dir: str = 'plots/transformer'):
-    """
-    Plots forces for x, y, z axes as subplots and saves the figures to the specified directory.
-
-    Args:
-        forces_pred: Predicted forces (Nx3 array).
-        forces_smooth: Smoothed predicted forces (Nx3 array).
-        forces_gt: Ground truth forces (Nx3 array).
-        avg_rmse: Average RMSE value for the run.
-        run: Run number.
-        pdf: Whether to save the plots as PDFs (if False, saves as PNG).
-        save_dir: Directory to save the plots (default is 'plots/').
-    """
-    assert forces_pred.shape == forces_gt.shape
-    assert forces_pred.shape[1] == 3
-
-    os.makedirs(save_dir, exist_ok=True)
-
-    time_axis = np.arange(forces_pred.shape[0])
-    axes = ["X", "Y", "Z"]
-
-    # Create a figure with three subplots for raw predictions
-    fig, axs = plt.subplots(3, 1, figsize=(8, 10), sharex=True)
-    fig.suptitle(f"Force Predictions vs Ground Truth, Run {run}, Avg RMSE: {avg_rmse:.4f}")
-
-    for i, ax_label in enumerate(axes):
-        axs[i].plot(time_axis, forces_pred[:, i], label='Predicted', linestyle='-', marker='')
-        axs[i].plot(time_axis, forces_gt[:, i], label='Ground Truth', linestyle='-', marker='')
-        axs[i].set_title(f"Force in {ax_label} Direction")
-        axs[i].set_ylabel('Force [N]')
-        axs[i].set_ylim(-1, 1)
-        axs[i].legend()
-
-    axs[-1].set_xlabel('Time')
-
-    save_path = os.path.join(save_dir, f"pred_run_{run}_forces.{'pdf' if pdf else 'png'}")
-    plt.tight_layout(rect=[0, 0, 1, 0.96])  # Adjust layout to fit the suptitle
-    plt.savefig(save_path)
-    plt.close()
-
-    # Create a second figure with three subplots for smoothed predictions
-    fig, axs = plt.subplots(3, 1, figsize=(8, 10), sharex=True)
-    fig.suptitle(f"Smoothed Force Predictions vs Ground Truth, Run {run}, Avg RMSE: {avg_rmse:.4f}")
-
-    for i, ax_label in enumerate(axes):
-        axs[i].plot(time_axis[:-1], forces_smooth[:, i], label='Smoothed Predictions', linestyle='-', marker='')
-        axs[i].plot(time_axis[:-1], forces_gt[:-1, i], label='Ground Truth', linestyle='-', marker='')
-        axs[i].set_title(f"Force in {ax_label} Direction")
-        axs[i].set_ylabel('Force [N]')
-        axs[i].set_ylim(-1, 1)
-        axs[i].legend()
-
-    axs[-1].set_xlabel('Time')
-
-    save_path = os.path.join(save_dir, f"pred_smooth_run_{run}_forces.{'pdf' if pdf else 'png'}")
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plt.savefig(save_path)
-    plt.close()
+def custom_collate_fn(batch):
+    imgs = torch.stack([b["img_right"] for b in batch]) if "img_right" in batch[0] else None
+    target_seq = torch.stack([b["target"] for b in batch])
+    # if sequence, take last step
+    forces = target_seq[:, -1] if target_seq.dim() == 3 else target_seq
+    robot_state = torch.stack([b["features"] for b in batch])
+    return {"img_right": imgs, "forces": forces, "robot_state": robot_state}
 
 @torch.no_grad()
-def eval_model(model: VisionRobotNet,
-               data_loader: DataLoader,
-               target_scaler: MinMaxScaler,
-               device: torch.device,
-               model_type: str) -> Tuple[np.ndarray, np.ndarray]:
+def infer(loader: DataLoader, model: nn.Module, args) -> Tuple[np.ndarray, np.ndarray]:
     model.eval()
-    n_samples = len(data_loader.dataset)
-    batch_size = data_loader.batch_size
-    forces_pred = torch.zeros((n_samples, 3), device=device)
-    forces_gt = torch.zeros((n_samples, 3), device=device)
-    i = 0
-    for batch in tqdm(data_loader):
-        if model_type == 'vision_robot':
-            img_left = batch["img_left"].to(device)
-            img_right = batch["img_right"].to(device)
-            features = batch["features"].to(device)
-            target = batch["target"].to(device)
-            out: torch.Tensor = model(img_left, img_right, features)
-            len_batch = target.size(0)
-            forces_pred[i*batch_size: i*batch_size + len_batch] = out
-            forces_gt[i * batch_size: i * batch_size + len_batch] = target
+    crit = nn.MSELoss()
+    rmse_meter = AverageMeter(i=1)
+    all_pred, all_gt = [], []
 
-        elif model_type == 'transformer':
-            robot_state = batch["features"].to(device)
-            target = batch["target"].to(device)
-            # Shape: [batch_size, seq_length, 3]
-            out: torch.Tensor = model(robot_state)
-            len_batch = target.size(0)
-            # Take the last value in the sequence of predictions
-            forces_pred[i*batch_size: i*batch_size + len_batch] = out[:, -1, :]
-            forces_gt[i * batch_size: i * batch_size +
-                      len_batch] = target[:, -1, :]
-        i += 1
-    forces_pred = forces_pred.cpu().detach().numpy()
-    forces_pred = target_scaler.inverse_transform(forces_pred)
-    forces_gt = forces_gt.cpu().detach().numpy()
-    forces_gt = target_scaler.inverse_transform(forces_gt)
-    avg_rmse = np.sqrt(mean_squared_error(
-        forces_gt, forces_pred, multioutput='uniform_average'))
-    return forces_pred, forces_gt, avg_rmse
+    for batch in loader:
+        tgt, pred = forward(args, batch, model)
+        rmse_meter.update([torch.sqrt(crit(pred, tgt)).item()])
+        all_pred.append(pred.cpu()); all_gt.append(tgt.cpu())
 
+    print(f"[INFO] Eval RMSE: {rmse_meter.avg[0]:.4f}  ({len(loader.dataset)} samples)")
+    return torch.cat(all_pred).numpy(), torch.cat(all_gt).numpy()
 
-def eval() -> None:
-    args = parse_cmd_line()
-    args.use_pretrained = False
+def forward(args, batch, model):
+    if args.type == "s":
+        st = batch["robot_state"].to(args.device).float()
+        tgt = batch["forces"].to(args.device).float()
+        pred = model(st)
+    elif args.type == "v":
+        img = batch["img_right"].to(args.device)
+        tgt = batch["forces"].to(args.device).float()
+        pred = model(img, None)
+    else:                                           # vs
+        img = batch["img_right"].to(args.device)
+        st  = batch["robot_state"].to(args.device).float()
+        tgt = batch["forces"].to(args.device).float()
+        pred = model(img, st)
+    return tgt, pred
 
-    if os.path.isdir(args.weights):
-        weights_path = os.path.join(args.weights, "best_params.pth")
+# ------------------  plotting & utils  ------------------------------ #
+def moving_average(x: np.ndarray, k: int = 5) -> np.ndarray:
+    if k <= 1: return x
+    cumsum = np.cumsum(np.pad(x, ((k-1,0),(0,0))), axis=0)
+    return (cumsum[k:] - cumsum[:-k]) / k
+
+def save_txt(out_dir: Path, name: str, arr: np.ndarray):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    np.savetxt(out_dir/f"{name}.txt", arr, delimiter=",",
+               header="Fx,Fy,Fz", comments='')
+
+def plot(forces_pred, forces_smooth, forces_gt, rmse, run_id, out_dir, pdf=False):
+    t = np.arange(len(forces_pred))
+    axes = ["X", "Y", "Z"]; ext = "pdf" if pdf else "png"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for smooth, label in [(forces_pred, "pred"), (forces_smooth, "smooth")]:
+        fig, axs = plt.subplots(3,1, figsize=(8,10), sharex=True)
+        fig.suptitle(f"Run {run_id} – {label} vs GT  (RMSE={rmse:.3f})")
+        for i, ax in enumerate(axs):
+            ax.plot(t[:len(smooth)], smooth[:,i], label=label)
+            ax.plot(t[:len(smooth)], forces_gt[:len(smooth),i], label="GT")
+            ax.set_ylabel(f"F{axes[i]} [N]"); ax.legend()
+        axs[-1].set_xlabel("Time (frames)")
+        fig.tight_layout(rect=[0,0,1,0.96])
+        fig.savefig(out_dir/f"{label}_run{run_id}.{ext}")
+        plt.close(fig)
+
+# ------------------  main eval routine  ----------------------------- #
+def main():
+    args = get_args()
+    ckpt = torch.load(args.checkpoint, map_location=args.device)
+    print(f"[INFO] Loaded checkpoint: {args.checkpoint}")
+
+    # ------- instantiate model -------
+    model = ForceEstimator(
+        architecture=args.architecture,
+        recurrency=args.recurrency,
+        pretrained=False,
+        att_type=args.att_type,
+        state_size=args.state_size,
+        seq_length=args.seq_length,
+    ).to(args.device)
+    model.load_state_dict(ckpt["state_dict"], strict=False)
+
+    # ------- dataset -------
+    if args.type == "s":
+        feats, forces, _, _ = load_dataset(
+            args.data_root, [args.run], [], sequential=True, crop_runs=False)
+        ds = SequentialDataset(feats, forces,
+                               seq_length=args.seq_length,
+                               normalize_targets=False)
+        collate = None
     else:
-        weights_path = args.weights
-    if not os.path.exists(weights_path) or not os.path.isfile(weights_path):
-        raise ValueError(f"Invalid weights: {weights_path}")
+        vt = get_val_transforms()
+        ds = VisionStateDataset(
+            mode="custom-single",
+            transform=vt,
+            recurrency_size=args.seq_length,
+            dataset=args.dataset,
+            occlude_param=none_or_str("None"),
+            force_policy_runs=[args.run]
+        )
+        collate = custom_collate_fn
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dl = DataLoader(ds, batch_size=64, shuffle=False,
+                    collate_fn=collate, num_workers=4)
 
-    if args.model_type == 'vision_robot':
-        model_config = util.get_vrn_config(args)
-        model = VisionRobotNet(model_config)
-    elif args.model_type == 'transformer':
-        config = util.get_transformer_config(args)
-        model = RobotStateTransformer(config)
+    # ------- inference -------
+    pred, gt = infer(dl, model, args)
+    rmse = np.sqrt(mean_squared_error(gt, pred))
 
-    model.load_state_dict(torch.load(weights_path))
+    # ------- post‑process & plots -------
+    smooth = moving_average(pred, k=5)
+    ts = int(time.time())
+    out_dir = Path("eval_outputs")/f"run{args.run}_{ts}"
+    save_txt(out_dir, "pred", pred); save_txt(out_dir, "smooth", smooth); save_txt(out_dir, "gt", gt)
+    plot(pred, smooth, gt, rmse, args.run, out_dir, pdf=args.pdf)
+    print(f"[✓] Outputs saved under {out_dir}")
 
-    model.to(device)
-    model.eval()
-    print(f"[INFO] Loaded model from: {weights_path}")
-    print(f"[INFO] Using Device: {device}")
-
-    batch_size = 32
-    path = "data"
-
-    if args.model_type == 'vision_robot':
-        data = util.load_dataset(path,
-                                 force_policy_runs=[args.run],
-                                 no_force_policy_runs=[],
-                                 sequential=False,
-                                 crop_runs=False,
-                                 use_acceleration=args.use_acceleration)
-        dataset = VisionRobotDataset(*data,
-                                     path=path,
-                                     img_transforms=constants.RES_NET_TEST_TRANSFORM,
-                                     feature_scaler_path=constants.FEATURE_SCALER_FN)
-    elif args.model_type == 'transformer':
-        weights_dir = args.weights
-        transformations_path = weights_dir.replace("weights/", "transformations/")
-        feature_scaler_path = transformations_path + "/feature_scaler.joblib"
-        target_scaler_path = transformations_path + "/target_scaler.joblib"
-
-        features, targets, _, _ = util.load_dataset(path,
-                                                    force_policy_runs=[
-                                                        args.run],
-                                                    no_force_policy_runs=[],
-                                                    sequential=True,
-                                                    crop_runs=False,
-                                                    use_acceleration=args.use_acceleration)
-        dataset = SequentialDataset(robot_features_list=features,
-                                    force_targets_list=targets,
-                                    normalize_targets=True,
-                                    seq_length=constants.SEQ_LENGTH,
-                                    feature_scaler_path=feature_scaler_path,
-                                    target_scaler_path=target_scaler_path)
-
-    print(f"[INFO] Loaded Dataset with {len(dataset)} samples!")
-    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-    target_scaler = joblib.load(target_scaler_path)
-    forces_pred, forces_gt, avg_rmse = eval_model(
-        model, data_loader, target_scaler, device, model_type=args.model_type)
-    forces_pred_smooth = moving_average(
-        forces_pred, window_size=constants.MOVING_AVG_WINDOW_SIZE)
-    save_predictions("predictions", forces_pred, forces_pred_smooth, forces_gt)
-    plot_forces(forces_pred, forces_pred_smooth,
-                forces_gt, avg_rmse, args.run, args.pdf,
-                f'plots/{weights_path.split("/")[-2]}')
-
-
+# ------------------------------------------------------------------ #
 if __name__ == "__main__":
-    eval()
+    main()
