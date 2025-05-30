@@ -265,19 +265,15 @@ from PIL import Image
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from torch.utils.data import Dataset
 from torchvision.transforms import Compose
-
-# -----------------------------------------------------------------------------
-#  Helper utils
-# -----------------------------------------------------------------------------
-
-def _fit_transform(arrs: List[np.ndarray], scaler) -> List[torch.Tensor]:
-    stacked = np.concatenate(arrs)
-    scaler.fit(stacked)
-    out: List[torch.Tensor] = []
-    for a in arrs:
-        out.append(torch.from_numpy(scaler.transform(a)).float())
-    return out
-
+from utils import custom_collate_fn, fit_transform
+from __future__ import annotations
+from typing import List, Optional, Tuple
+from pathlib import Path
+import joblib, numpy as np, torch
+from PIL import Image
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from torch.utils.data import Dataset
+from torchvision.transforms import Compose
 
 # -----------------------------------------------------------------------------
 #  SequentialDataset (robot state + force, only state matters for training)  --
@@ -439,3 +435,72 @@ class VisionRobotDataset(Dataset):
             "features": self.robot_features[idx : idx + self.seq_length],   # (T, S)
             "target": self.force_targets[idx : idx + self.seq_length],      # (T, 3)
         }
+
+
+
+
+
+
+class VisionRobotDataset(Dataset):
+    """
+    Single‑frame or sliding‑window dataset of images + robot state + forces.
+    """
+
+    def __init__(
+        self,
+        *,
+        robot_features: np.ndarray,
+        force_targets: np.ndarray,
+        img_left_paths: List[str],
+        img_right_paths: List[str],
+        path: str,
+        img_transforms: Optional[Compose] = None,
+        seq_length: int = 1,
+        feature_scaler_path: Optional[str] = None,
+        target_scaler_path: Optional[str] = None,
+    ) -> None:
+        super().__init__()
+        self.root = Path(path)
+        self.seq_length = seq_length
+        self.transforms = img_transforms
+
+        # ------- scalers -------------------------------------------------
+        if feature_scaler_path and Path(feature_scaler_path).is_file():
+            fscaler: StandardScaler = joblib.load(feature_scaler_path)
+            robot_features = fscaler.transform(robot_features)
+        if target_scaler_path and Path(target_scaler_path).is_file():
+            tscaler: MinMaxScaler = joblib.load(target_scaler_path)
+            force_targets = tscaler.transform(force_targets)
+
+        self.robot_features = torch.from_numpy(robot_features).float()
+        self.force_targets = torch.from_numpy(force_targets).float()
+        self.img_left_paths, self.img_right_paths = img_left_paths, img_right_paths
+        self.N = len(img_right_paths)
+        assert self.N == len(robot_features) == len(force_targets)
+
+    # ------------------------------ magic ------------------------------
+    def __len__(self):                # sliding‑window‑aware length
+        return self.N - self.seq_length + 1 if self.seq_length > 1 else self.N
+
+    def _load_pair(self, i: int) -> Tuple[Image.Image, Image.Image]:
+        L = Image.open(self.root/self.img_left_paths[i]).convert("RGB")
+        R = Image.open(self.root/self.img_right_paths[i]).convert("RGB")
+        return L, R
+
+    def __getitem__(self, idx):
+        if self.seq_length == 1:
+            L, R = self._load_pair(idx)
+            if self.transforms: L, R = self.transforms(L), self.transforms(R)
+            return {"img_left": L, "img_right": R,
+                    "features": self.robot_features[idx],
+                    "target":   self.force_targets[idx]}
+        # ---- sliding window ------------------------------------------
+        sl = slice(idx, idx+self.seq_length)
+        imgs_LR = [self._load_pair(i) for i in range(idx, idx+self.seq_length)]
+        Ls, Rs = zip(*imgs_LR)
+        if self.transforms:
+            Ls, Rs = [self.transforms(i) for i in Ls], [self.transforms(i) for i in Rs]
+        return {"img_left":  torch.stack(Ls),
+                "img_right": torch.stack(Rs),
+                "features":  self.robot_features[sl],
+                "target":    self.force_targets[sl]}

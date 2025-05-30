@@ -80,7 +80,7 @@ def process_depth(rgb_depth: torch.Tensor) -> torch.Tensor:
     return (depth.float() - depth.mean()) / depth.std()
 
 class VisionStateDataset(Dataset):
-    """A dataset to load data from dfferent folders that are arranged this way:
+    """A dataset to load data from different folders that are arranged this way:
         root/scene_1/000.png
         root/scene_1/001.png
         ...
@@ -96,6 +96,14 @@ class VisionStateDataset(Dataset):
         assert dataset in ["dafoes", "dvrk", "mixed"], "The only available datasets are dafoes, dvrk or mixed"
         assert mode in ["train", "val", "test"], "There is only 3 modes for the dataset: train, validation or test"
 
+        print(f"\nInitializing VisionStateDataset:")
+        print(f"- Dataset type: {dataset}")
+        print(f"- Mode: {mode}")
+        print(f"- Recurrency size: {recurrency_size}")
+        print(f"- Load depths: {load_depths}")
+        print(f"- Train type: {train_type}")
+        print(f"- Occlusion param: {occlude_param}")
+
         np.random.seed(seed)
         random.seed(seed)
 
@@ -106,14 +114,18 @@ class VisionStateDataset(Dataset):
         if dataset == "dafoes":
             data_root_dafoes = root/"visu_depth_haptic_data"
             self.data_root_dafoes = data_root_dafoes
+            print(f"- DaFoEs data root: {data_root_dafoes}")
         elif dataset == "dvrk":
             data_root_dvrk = root/"experiment_data"
             self.data_root_dvrk = data_root_dvrk
+            print(f"- DVRK data root: {data_root_dvrk}")
         else:
             data_root_dafoes = root/"visu_depth_haptic_data"
             data_root_dvrk = root/"experiment_data"
             self.data_root_dafoes = data_root_dafoes
             self.data_root_dvrk = data_root_dvrk
+            print(f"- DaFoEs data root: {data_root_dafoes}")
+            print(f"- DVRK data root: {data_root_dvrk}")
 
         self.occlusion = {"force_sensor": [0, 6],
                           "robot_p": [6, 9],
@@ -127,17 +139,26 @@ class VisionStateDataset(Dataset):
                           "robot_tqd": [47, 54]
                         }
         
+        # Load scene lists and validate paths
         if dataset == "dafoes":
             scene_list_path = self.data_root_dafoes/"{}.txt".format(mode) if train_type=="random" else self.data_root_dafoes/"{}_{}.txt".format(mode, train_type)
+            assert scene_list_path.exists(), f"Scene list not found: {scene_list_path}"
             self.scenes = [self.data_root_dafoes/folder[:-1] for folder in open(scene_list_path)][:-1]
+            print(f"- Found {len(self.scenes)} DaFoEs scenes")
         elif dataset == "dvrk":
             scene_list_path = self.data_root_dvrk/"{}.txt".format(mode)
+            assert scene_list_path.exists(), f"Scene list not found: {scene_list_path}"
             self.folder_index = [folder.split('_')[-1].rstrip('\n') for folder in open(scene_list_path)]
+            print(f"- Found {len(self.folder_index)} DVRK folders")
         else:
-            scene_list_path = self.data_root_dafoes/"{}.txt".format(mode) if train_type=="random" else self.data_root_dafoes/"{}_{}.txt".format(mode, train_type)
-            self.scenes = [self.data_root_dafoes/folder[:-1] for folder in open(scene_list_path)][:-1]
-            scene_list_path = self.data_root_dvrk/"{}.txt".format(mode)
-            self.folder_index = [folder.split('_')[-1].rstrip('\n') for folder in open(scene_list_path)]
+            # Mixed dataset
+            dafoes_list = self.data_root_dafoes/"{}.txt".format(mode) if train_type=="random" else self.data_root_dafoes/"{}_{}.txt".format(mode, train_type)
+            dvrk_list = self.data_root_dvrk/"{}.txt".format(mode)
+            assert dafoes_list.exists(), f"DaFoEs scene list not found: {dafoes_list}"
+            assert dvrk_list.exists(), f"DVRK scene list not found: {dvrk_list}"
+            self.scenes = [self.data_root_dafoes/folder[:-1] for folder in open(dafoes_list)][:-1]
+            self.folder_index = [folder.split('_')[-1].rstrip('\n') for folder in open(dvrk_list)]
+            print(f"- Found {len(self.scenes)} DaFoEs scenes and {len(self.folder_index)} DVRK folders")
 
         self.transform = transform
         self.mode = mode
@@ -145,22 +166,27 @@ class VisionStateDataset(Dataset):
         self.max_depth = max_depth
         self.recurrency_size = recurrency_size
         self.occlude_param = occlude_param
-        self.crawl_folders()
         
+        print("\nCrawling folders to build dataset...")
+        self.crawl_folders()
+        print(f"Dataset initialization complete. Total samples: {len(self)}\n")
         
     def crawl_folders(self):
-        
         samples = []
         
         if self.dataset == "dafoes":
             samples = self.load_dafoes(samples)
+            print(f"Loaded {len(samples)} DaFoEs samples")
         
         elif self.dataset == "dvrk":
             samples = self.load_dvrk(samples)
+            print(f"Loaded {len(samples)} DVRK samples")
         
         else:
             samples = self.load_dafoes(samples)
+            dafoes_count = len(samples)
             samples = self.load_dvrk(samples)
+            print(f"Loaded {dafoes_count} DaFoEs samples and {len(samples) - dafoes_count} DVRK samples")
 
         if self.mode in ["train", "val"]:
             random.shuffle(samples)
@@ -168,25 +194,28 @@ class VisionStateDataset(Dataset):
         self.samples = samples
     
     def load_dafoes(self, samples):
-
         mean_labels, std_labels = [], []
         mean_forces, std_forces = [], []
 
+        print("\nLoading DaFoEs data...")
         for scene in self.scenes:
+            print(f"Processing scene: {scene}")
             labels = np.array(pd.read_csv(scene/'labels.csv')).astype(np.float32)
-            # plot_forces(labels[140:, 0:3])
             scene_rgb = scene/"RGB_frames"
             if self.load_depths:
                 scene_depth = scene/"Depth_frames"
                 depth_maps = sorted(scene_depth.files("*.png"))
+                print(f"- Found {len(depth_maps)} depth maps")
 
-            #Appending mean and std for the normalization of the labels
+            # Validate and log data shapes
+            print(f"- Labels shape: {labels.shape}")
             mean_labels.append(labels[:, :26].mean(axis=0))
             std_labels.append(labels[:, :26].std(axis=0))
             mean_forces.append((labels[:, 26:29]).mean(axis=0))
             std_forces.append((labels[:, 26:29]).std(axis=0))
 
             images = sorted(scene_rgb.files("*.png"))
+            print(f"- Found {len(images)} RGB images")
             
             n_labels = len(labels) // len(images)
             step = 7
@@ -195,7 +224,7 @@ class VisionStateDataset(Dataset):
                 if i < 20: continue
                 if i + self.recurrency_size > len(images) - 20: break
                 sample = {}
-                sample['dataset'] = "dafoes" # Create a flag to identify it during processing
+                sample['dataset'] = "dafoes"
                 sample['img'] = [im for im in images[i:i+self.recurrency_size]]
                 if self.load_depths:
                     sample['depth'] = [depth for depth in depth_maps[i:i+self.recurrency_size]]
@@ -203,116 +232,132 @@ class VisionStateDataset(Dataset):
                 sample['label'] = [np.mean(labels[n_labels*i+a: (n_labels*i+a) + step, :26], axis=0) for a in range(self.recurrency_size)]
                 sample['force'] = np.mean(labels[n_labels*i+(self.recurrency_size-1):(n_labels*i+(self.recurrency_size-1)) + step, 26:29], axis=0)
                 samples.append(sample)
+
+                # Log sample shapes periodically
+                if len(samples) % 1000 == 0:
+                    print(f"\nSample {len(samples)} shapes:")
+                    print(f"- Image sequence length: {len(sample['img'])}")
+                    print(f"- Label sequence shape: {np.array(sample['label']).shape}")
+                    print(f"- Force target shape: {sample['force'].shape}")
+                    if self.load_depths:
+                        print(f"- Depth sequence length: {len(sample['depth'])}")
         
         if self.mode == "train":
-            self.mean_labels = np.mean(mean_labels, axis = 0) 
-            self.std_labels = np.mean(std_labels, axis = 0)
-            self.mean_forces = np.mean(mean_forces, axis = 0)
-            self.std_forces = np.mean(std_forces, axis = 0)
+            print("\nComputing and saving normalization metrics...")
+            self.mean_labels = np.mean(mean_labels, axis=0)
+            self.std_labels = np.mean(std_labels, axis=0)
+            self.mean_forces = np.mean(mean_forces, axis=0)
+            self.std_forces = np.mean(std_forces, axis=0)
+
+            print(f"- Label means range: [{self.mean_labels.min():.3f}, {self.mean_labels.max():.3f}]")
+            print(f"- Label stds range: [{self.std_labels.min():.3f}, {self.std_labels.max():.3f}]")
+            print(f"- Force means: {self.mean_forces}")
+            print(f"- Force stds: {self.std_forces}")
 
             save_metric('labels_mean.npy', self.mean_labels)
             save_metric('labels_std.npy', self.std_labels)
             save_metric('forces_mean.npy', self.mean_forces)
             save_metric('forces_std.npy', self.std_forces)
         else:
+            print("\nLoading pre-computed normalization metrics...")
             self.mean_labels, self.std_labels, self.mean_forces, self.std_forces = load_metrics("dafoes")
 
         return samples
     
     def load_dvrk(self, samples):
-
         mean_labels, std_labels = [], []
         mean_forces, std_forces = [], []
 
+        print("\nLoading DVRK data...")
         for index in self.folder_index:
-
+            print(f"Processing folder {index}")
             labels, forces = read_labels(self.data_root_dvrk/'labels_{}.txt'.format(index))
-            # plot_forces(forces)
             scene = self.data_root_dvrk/"imageset_{}".format(index)
 
-            # Appending mean and std for the normalization of the labels
+            # Log data shapes
+            print(f"- Labels shape: {labels.shape}")
+            print(f"- Forces shape: {forces.shape}")
+
             mean_labels.append(labels.mean(axis=0))
             std_labels.append(labels.std(axis=0))
             mean_forces.append(forces.mean(axis=0))
             std_forces.append(forces.std(axis=0))
 
             images = sorted(scene.files("*.jpg"))
+            print(f"- Found {len(images)} images")
+            
             labels = labels.reshape(len(images), -1)
             forces = forces.reshape(len(images), -1)
-
 
             for i in range(len(images)):
                 if i < 80: continue
                 if i > len(images) - (25 + self.recurrency_size): break
                 sample = {}
-                sample['dataset'] = "dvrk" # Flag to identify the data for processing
+                sample['dataset'] = "dvrk"
                 sample['img'] = [scene/'img_{}.jpg'.format(i+a) for a in range(self.recurrency_size)]
-                sample['label'] = [labels[i+a] for a in range(self.recurrency_size)] 
-                sample['force'] = forces[i+(self.recurrency_size-1)]
+                sample['label'] = [labels[i+a] for a in range(self.recurrency_size)]
+                sample['force'] = forces[i+self.recurrency_size-1]
                 samples.append(sample)
-        
-        if self.mode == "train":
-            self.mean_dvrk_labels = np.mean(mean_labels, axis = 0) 
-            self.std_dvrk_labels = np.mean(std_labels, axis = 0)
-            self.mean_dvrk_forces = np.mean(mean_forces, axis = 0)
-            self.std_dvrk_forces = np.mean(std_forces, axis = 0)
 
-            save_metric('labels_mean_dvrk.npy', self.mean_dvrk_labels)
-            save_metric('labels_std_dvrk.npy', self.std_dvrk_labels)
-            save_metric('forces_mean_dvrk.npy', self.mean_dvrk_forces)
-            save_metric('forces_std_dvrk.npy', self.std_dvrk_forces)
-        
-        else:
-            self.mean_dvrk_labels, self.std_dvrk_labels, self.mean_dvrk_forces, self.std_dvrk_forces = load_metrics("dvrk")
+                # Log sample shapes periodically
+                if len(samples) % 1000 == 0:
+                    print(f"\nSample {len(samples)} shapes:")
+                    print(f"- Image sequence length: {len(sample['img'])}")
+                    print(f"- Label sequence shape: {np.array(sample['label']).shape}")
+                    print(f"- Force target shape: {sample['force'].shape}")
+
+        if self.mode == "train":
+            print("\nComputing normalization metrics...")
+            print(f"- Label means range: [{np.mean(mean_labels).min():.3f}, {np.mean(mean_labels).max():.3f}]")
+            print(f"- Label stds range: [{np.mean(std_labels).min():.3f}, {np.mean(std_labels).max():.3f}]")
+            print(f"- Force means range: [{np.mean(mean_forces).min():.3f}, {np.mean(mean_forces).max():.3f}]")
+            print(f"- Force stds range: [{np.mean(std_forces).min():.3f}, {np.mean(std_forces).max():.3f}]")
 
         return samples
-    
+
     def __getitem__(self, index: int) -> Dict[str, List[torch.Tensor]]:
+        """Get a sequence of frames with corresponding labels."""
         sample = self.samples[index]
-        imgs = [load_as_float(img) for img in sample['img']]
         
-        if self.load_depths:
-            if self.dataset == "dafoes":
-                depths = [load_depth(depth) for depth in sample['depth']]
-            elif self.dataset == "dvrk":
-                depths = [np.random.randn(imgs[0].shape) for _ in range(len(imgs))]
-            else:
-                if sample['dataset'] == "dafoes":
-                    depths = [load_depth(depth) for depth in sample['depth']]
-                else:
-                    depths = [np.random.randn(imgs[0].shape) for _ in range(len(imgs))]
-        else:
-            depths = None
+        # Load and transform images
+        imgs = []
+        for img_path in sample['img']:
+            img = imageio.imread(img_path)[:,:,:3].astype(np.float32)
+            if self.transform is not None:
+                img = self.transform(img)
+            imgs.append(img)
         
-        labels = sample['label']
-        forces = sample['force']
-
-        if self.transform is not None:
-            imgs, depths, labels, forces = self.transform(imgs, depths, labels, forces, sample["dataset"])
+        # Load depths if required
+        depths = None
+        if self.load_depths and 'depth' in sample:
+            depths = []
+            for depth_path in sample['depth']:
+                depth = load_depth(depth_path)
+                if self.transform is not None:
+                    depth = self.transform(depth)
+                depths.append(depth)
+            depths = torch.stack(depths)
         
-        if sample['dataset'] == "dafoes":
-            norm_label = np.array([(label[:26] - self.mean_labels[:26]) / (self.std_labels[:26] + 1e-10) for label in labels])
-            norm_label = dafoes_2_dvrk(norm_label)
-        else:
-            norm_label = np.array([(label - self.mean_dvrk_labels) / (self.std_dvrk_labels + 1e-10) for label in labels])
-
-        if self.occlude_param:
-            start, end = self.occlusion[self.occlude_param]
-            norm_label[:, start:end] = 0.
-
-        if sample['dataset'] == 'dafoes':
-            norm_force = (forces - self.mean_forces) / (self.std_forces + 1e-10)
-        else:
-            norm_force = (forces - self.mean_dvrk_forces) / (self.std_dvrk_forces + 1e-10)
+        # Convert labels and forces to tensors
+        labels = torch.FloatTensor(sample['label'])
+        force = torch.FloatTensor(sample['force'])
         
-        if self.load_depths:
-            depths = [process_depth(depth) for depth in depths]
-            imgd = [torch.cat([img, depth], dim=0) for img, depth in zip(imgs, depths)]
-        else:
-            imgd = imgs
+        # Log shapes periodically
+        if index % 1000 == 0:
+            print(f"\nItem {index} shapes:")
+            print(f"- Images: {torch.stack(imgs).shape}")
+            print(f"- Labels: {labels.shape}")
+            print(f"- Force: {force.shape}")
+            if depths is not None:
+                print(f"- Depths: {depths.shape}")
+        
+        return {
+            'images': torch.stack(imgs),
+            'depths': depths,
+            'labels': labels,
+            'force': force,
+            'dataset': sample['dataset']
+        }
 
-        return {'img': imgd[0] if self.recurrency_size==1 else imgd, 'robot_state': norm_label, 
-                'forces': norm_force, 'dataset': sample['dataset']}
-    
     def __len__(self):
         return len(self.samples)

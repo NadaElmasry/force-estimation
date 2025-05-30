@@ -359,6 +359,31 @@ class ForceEstimator(nn.Module):
                     nn.Linear(64, 3),
                 )
 
+    # ───────────────────────────────────────── helpers ──────────────────────
+    def _encode_image_frames(self, img: torch.Tensor) -> torch.Tensor:
+        """
+        img : (B*T, C, H, W)  flattened over time
+        Returns : (B*T, embed_dim)  – **after img_proj** (ready for LSTM/FC)
+        """
+        if self.architecture == "cnn":
+            x = self.cnn_pool(self.cnn_stem(img)).view(img.size(0), -1)
+        else:  # vit
+            patches = self.vit.to_patch_embedding(img)
+            cls = repeat(self.cls_token, "1 1 d -> b 1 d", b=patches.size(0))
+            tokens = torch.cat((cls, patches), dim=1)
+            tokens = self.vit.transformer(tokens)
+            x = tokens[:, 0]                    # CLS
+        return self.img_proj(x)                 # (N, embed_dim)
+
+    @torch.no_grad()
+    def get_image_latent(self, img: torch.Tensor) -> torch.Tensor:
+        """
+        Public helper for logging: returns (N, embed_dim) per‑frame latent.
+        `img` must be (N,3,H,W) – caller flattens time if needed.
+        """
+        self.eval()
+        return self._encode_image_frames(img)            
+
     # =====================================================================  FORWARD  ==
     def forward(self, img: torch.Tensor, state: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Forward pass.
@@ -384,19 +409,21 @@ class ForceEstimator(nn.Module):
             B, C, H, W = img.shape
             T = 1
             assert self.seq_length == 1, "Provided single frame but seq_length > 1"
+            img_flat = img
 
-        # ---------------  Per‑frame feature extraction  ---------------
-        if self.architecture == "cnn":
-            feats = self.cnn_pool(self.cnn_stem(img))  # (B*T, 2048, 1, 1)
-            feats = feats.view(feats.size(0), -1)      # (B*T, 2048)
-        else:  # vit
-            vit_out = self.vit.to_patch_embedding(img)   # (B*T, N, 1024)
-            cls = repeat(self.cls_token, "1 1 d -> b 1 d", b=vit_out.size(0))
-            vit_in = torch.cat((cls, vit_out), dim=1)
-            vit_out = self.vit.transformer(vit_in)       # (B*T, N+1, 1024)
-            feats = vit_out[:, 0]                        # CLS token
+        feats = self._encode_image_frames(img_flat)          # (B*T, D)
+        # # ---------------  Per‑frame feature extraction  ---------------
+        # if self.architecture == "cnn":
+        #     feats = self.cnn_pool(self.cnn_stem(img))  # (B*T, 2048, 1, 1)
+        #     feats = feats.view(feats.size(0), -1)      # (B*T, 2048)
+        # else:  # vit
+        #     vit_out = self.vit.to_patch_embedding(img)   # (B*T, N, 1024)
+        #     cls = repeat(self.cls_token, "1 1 d -> b 1 d", b=vit_out.size(0))
+        #     vit_in = torch.cat((cls, vit_out), dim=1)
+        #     vit_out = self.vit.transformer(vit_in)       # (B*T, N+1, 1024)
+        #     feats = vit_out[:, 0]                        # CLS token
 
-        feats = self.img_proj(feats)  # (B*T, embed_dim)
+        # feats = self.img_proj(feats)  # (B*T, embed_dim)
 
         if self.recurrency:
             feats = feats.view(B, T, -1)  # (B, T, embed_dim)
